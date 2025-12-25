@@ -1,0 +1,379 @@
+#部分注释由deepseek生成，可能存在错误（因为我不是相关专业学生，代码是从网上公开的代码修改而来）
+#最核心的参考资料：https://www.bilibili.com/video/BV1qWwke5E3K/?spm_id_from=333.1387.favlist.content.click&vd_source=3e1ef69792fef80132cc15ca51106830
+#导入相关的包
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+from dataclasses import dataclass
+
+#设置pytorch的随机数种子，确保结果可重复，设置了固定的随机种子的话随机初始化权重、随机采样这两步操作每次都会产生相同的结果
+torch.manual_seed(1024)
+
+#@dataclass是python3.7+引入的一个类装饰器，用于自动生成特殊方法，让类更适合作为数据容器，在这里面的作用是让GPTConfig类变得更简洁、更易用
+#使用@dataclass后GPTConfig类只需要声明字段和默认值，Python会自动生成相关方法
+@dataclass
+
+#定义了GPTConfig这一个类，这一个类包含了整个模型的参数
+class GPTConfig:
+    #block_size是模型能够处理的最大上下文长度，决定了模型最多能处理多少个token
+    block_size: int = 512
+    #batch_size指的是一次同时处理的数据样本的数量，决定了一次为给模型多少个训练样本
+    batch_size: int = 12
+    #n_layer是transformer层的数量，是用来控制模型复杂度和模型的能力的关键参数之一
+    n_layer: int = 12
+    #n_head是注意力头的数量，决定了模型同时关注不同方面的信息的能力，就像是多个人同时读同一段文字，每个人关注不同的终点然后把所有人的理解综合起来
+    n_head: int = 12
+    #n_embd是嵌入维度，决定了模型内部表示每个token的向量大小，这是控制模型容量和表达能力的关键参数之一，决定了模型能够存储和展示信息的“丰富程度”
+    #n_embd被设置为768表示每个token被表示为768维的向量
+    n_embd: int = 768
+    #定义一个名为hidden_dim的字段，其默认值与上面的n_embd相同，隐藏层的维度和嵌入维度相等
+    hidden_dim: int = n_embd
+    #定义了dropout率，防止模型过拟合的一种正则化技术，在训练时随机关闭一部分神经元，强制模型不依赖特定神经元
+    #训练过程中每个神经元有10%的概率被临时停用
+    dropout: float = 0.1
+
+    head_size: int = n_embd // n_head
+
+    vocab_size: int = 50257
+
+
+class SingleHeadAttention(nn.Module):
+
+    def __init__(self, config):
+
+        super().__init__()
+
+        self.head_size = config.head_size
+
+        self.key = nn.Linear(config.hidden_dim, config.head_size)
+
+        self.value = nn.Linear(config.hidden_dim, config.head_size)
+
+        self.query = nn.Linear(config.hidden_dim, config.head_size)
+
+        
+
+        self.register_buffer(
+            "attention_mask",
+            torch.tril(
+                torch.ones(config.block_size, config.block_size)
+            )
+        )
+       
+        self.dropout = nn.Dropout(config.dropout)
+
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.size()
+
+        k = self.key(x)
+        
+        q = self.query(x)
+        
+        v = self.value(x)
+        
+        
+
+        weight = q @ k.transpose(-2, -1)  # (batch, seq_len, seq_len)
+        
+
+        weight = weight.masked_fill(
+            self.attention_mask[:seq_len, :seq_len] == 0,
+            float('-inf')
+        )
+        
+
+        weight = F.softmax(weight / math.sqrt(self.head_size), dim=-1)
+
+        weight = self.dropout(weight)
+        
+
+        output = weight @ v 
+
+        return output
+
+
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, config):
+
+        super().__init__()
+
+        self.heads = nn.ModuleList(
+            [
+                SingleHeadAttention(config)
+                for _ in range(config.n_head)
+            ]
+        )
+
+
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.dropout = nn.Dropout(config.dropout)
+
+
+    def forward(self, x):
+
+        outputs = [h(x) for h in self.heads]
+
+        output = torch.cat(outputs, dim=-1)
+
+        output = self.proj(output)
+
+        output = self.dropout(output)
+
+        return output
+    
+    
+class FeedForward(nn.Module):
+
+    def __init__(self, config):
+
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.GELU(), 
+            nn.Linear(4 * config.n_embd, config.n_embd), 
+            nn.Dropout(config.dropout)
+        )
+        
+    def forward(self, x):
+
+        return self.net(x)
+    
+class Block(nn.Module):
+
+    def __init__(self, config):
+
+        super().__init__()
+
+        self.att = MultiHeadAttention(config)
+
+        self.ffn = FeedForward(config)
+
+        self.ln1 = nn.LayerNorm(config.n_embd)
+
+        self.ln2 = nn.LayerNorm(config.n_embd) 
+
+
+    def forward(self, x):
+
+        x = x + self.att(self.ln1(x))
+
+        x = x + self.ffn(self.ln2(x))
+
+        return x
+    
+class GPT(nn.Module):
+
+    def __init__(self, config):
+
+        super().__init__()
+
+        self.config = config
+        
+
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
+        
+
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        
+
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        
+
+        self.ln_final = nn.LayerNorm(config.n_embd)
+        
+
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+
+        self.lm_head.weight = self.token_embedding_table.weight
+
+
+    def forward(self, idx, targets=None):
+
+        batch, seq_len = idx.size()
+        
+
+        token_emb = self.token_embedding_table(idx)  
+        
+
+        pos_emb = self.position_embedding_table(
+            torch.arange(seq_len, device=idx.device)
+        ).unsqueeze(0)
+        
+
+        x = token_emb + pos_emb
+        
+
+        x = self.blocks(x)
+        
+ 
+        x = self.ln_final(x)
+        
+
+        logits = self.lm_head(x)
+        
+
+        if targets is None:
+            loss = None
+        else:
+            batch, seq_len, vocab_size = logits.size()
+            logits = logits.view(batch * seq_len, vocab_size)
+            targets = targets.view(batch * seq_len)
+            loss = F.cross_entropy(logits, targets)
+        
+        return logits, loss
+
+
+    def generate(self, idx, max_new_tokens):
+
+        for _ in range(max_new_tokens):
+
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            
+
+            logits, _ = self(idx_cond)
+
+            logits = logits[:, -1, :]
+            
+
+            probs = F.softmax(logits, dim=-1)
+            
+
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+
+            idx = torch.cat((idx, idx_next), dim=1)
+        
+        return idx
+
+
+config = GPTConfig()
+
+model = GPT(config)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = model.to(device)
+
+
+print(f"模型已创建，设备: {device}")
+
+print(f"模型参数数量: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+
+
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
+
+
+def chat_with_model():
+
+
+    print("未训练的GPT对话系统")
+    print("注意：这是一个未经训练的随机模型，输出是随机的！")
+    print("输入 'quit' 退出对话")
+
+    
+    while True:
+
+        user_input = input("\n你: ").strip()
+        
+
+        if user_input.lower() in ['quit', '退出', 'exit', 'q']:
+            print("对话结束！")
+            break
+            
+        if not user_input:
+            print("请说点什么吧！")
+            continue
+            
+        try:
+
+            input_ids = enc.encode(user_input)
+            
+
+            if len(input_ids) > config.block_size - 50:
+                input_ids = input_ids[:config.block_size - 50]
+            
+
+            input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
+            
+            print("模型（随机输出）: ", end="", flush=True)
+            
+
+            with torch.no_grad():
+
+                generated_ids = model.generate(input_tensor, max_new_tokens=50)
+                
+
+                generated_text = enc.decode(generated_ids[0].tolist())
+                
+
+                new_text = generated_text[len(user_input):]
+                print(new_text[:200])
+                
+        except Exception as e:
+            print(f"生成时出错: {e}")
+
+
+def test_model():
+
+    print("\n测试模型生成...")
+    
+
+    test_input = "Hello"
+
+    input_ids = enc.encode(test_input)
+
+    input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
+
+    
+    print(f"输入: {test_input}")
+    print(f"输入tensor形状: {input_tensor.shape}")
+    
+
+    with torch.no_grad():
+        logits, loss = model(input_tensor)
+        print(f"前向传播成功! Logits形状: {logits.shape}")
+        
+
+        print("\n尝试生成文本...")
+        generated_ids = model.generate(input_tensor, max_new_tokens=20)
+        generated_text = enc.decode(generated_ids[0].tolist())
+        print(f"完整生成结果: {generated_text}")
+        print(f"新生成的部分: {generated_text[len(test_input):]}")
+
+
+#主程序部分
+if __name__ == "__main__":
+
+    test_model()
+    
+    print("\n选择模式:")
+    print("1. 对话模式")
+    print("2. 随机文本生成")
+    
+    choice = input("请选择 (1/2): ").strip()
+    
+    if choice == "1":
+        chat_with_model()
+    else:
+
+        print("\n随机文本生成:")
+        print("=" * 50)
+        
+
+        start_tokens = enc.encode("Once upon a time")
+        start_tensor = torch.tensor([start_tokens], dtype=torch.long).to(device)
+        
+        with torch.no_grad():
+            generated_ids = model.generate(start_tensor, max_new_tokens=100)
+            generated_text = enc.decode(generated_ids[0].tolist())
+            print(generated_text)
